@@ -1240,6 +1240,20 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 				"rate-control=cbr",
 			}},
 		},
+
+		{
+			method:  "vaapi",
+			element: "vaapih264enc",
+			label:   "VAAPI hardware encoding (legacy vaapih264enc)",
+			result: encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: []string{
+				"vaapih264enc",
+				fmt.Sprintf("bitrate=%d", bitrate),
+				fmt.Sprintf("keyframe-period=%d", keyframeInterval),
+				"max-bframes=0",
+				"rate-control=cbr",
+				"quality-level=7",
+			}},
+		},
 		{
 			method:  "openh264",
 			element: "openh264enc",

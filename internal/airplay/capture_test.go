@@ -714,7 +714,6 @@ func TestDetectGstEncoderRejectsMissingExplicitOpenH264(t *testing.T) {
 }
 
 func TestDetectGstEncoderSelectionContract(t *testing.T) {
-	allProbes := []string{"vulkanh264enc", "nvh264enc", "vah264enc", "openh264enc", "x264enc"}
 	tests := []struct {
 		name        string
 		method      string
@@ -728,18 +727,18 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			method:      "auto",
 			available:   map[string]bool{"openh264enc": true, "x264enc": true},
 			wantEncoder: "openh264enc",
-			wantProbes:  allProbes[:4],
+			wantProbes:  []string{"vulkanh264enc", "nvh264enc", "vah264enc", "vaapih264enc", "openh264enc"},
 		},
 		{
 			name:        "empty aliases auto and reaches x264",
 			available:   map[string]bool{"x264enc": true},
 			wantEncoder: "x264enc",
-			wantProbes:  allProbes,
+			wantProbes:  []string{"vulkanh264enc", "nvh264enc", "vah264enc", "vaapih264enc", "openh264enc", "x264enc"},
 		},
 		{
 			name:       "auto errors when no encoder exists",
 			method:     "auto",
-			wantProbes: allProbes,
+			wantProbes: []string{"vulkanh264enc", "nvh264enc", "vah264enc", "vaapih264enc", "openh264enc", "x264enc"},
 			wantError:  "no supported GStreamer H.264 encoder",
 		},
 		{
@@ -767,7 +766,7 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			name:       "missing vaapi does not cross fallback",
 			method:     "vaapi",
 			available:  map[string]bool{"openh264enc": true, "x264enc": true},
-			wantProbes: []string{"vah264enc"},
+			wantProbes: []string{"vah264enc", "vaapih264enc"},
 			wantError:  "vah264enc",
 		},
 		{
