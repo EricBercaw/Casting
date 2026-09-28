@@ -44,6 +44,8 @@ func (targets screenLatencyTargets) withMinimumVideoLead(minimum time.Duration) 
 }
 
 var targetLatencyNS atomic.Int64
+var latencyMarginNS atomic.Int64
+var audioOffsetNS atomic.Int64
 
 // SetTargetLatency sets the application's explicit joint playout lead. Apple's
 // own screen and audio overrides are independent, but doubletake historically
@@ -62,6 +64,70 @@ func SetTargetLatency(d time.Duration) {
 		d = 2 * time.Second
 	}
 	targetLatencyNS.Store(int64(d))
+}
+
+// SetLatencyMargin adds extra buffering to the automatic
+// AirPlay audio/video latency policy while preserving the relative
+// timing selected by that policy.
+//
+// For example, the normal automatic profile is:
+//
+//	video = 75 ms
+//	audio = 85 ms
+//
+// A 40 ms margin produces:
+//
+//	video = 115 ms
+//	audio = 125 ms
+//
+// The margin only applies when SetTargetLatency is automatic
+// (target latency <= 0). An explicit target latency continues
+// to override both audio and video with one common value.
+func SetLatencyMargin(d time.Duration) {
+	if d <= 0 {
+		latencyMarginNS.Store(0)
+		return
+	}
+
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+
+	latencyMarginNS.Store(int64(d))
+}
+
+// SetAudioOffset applies a signed audio-only playout offset.
+//
+// Positive values delay audio relative to video.
+// Negative values advance audio relative to video.
+//
+// This is applied after Doubletake chooses the normal automatic
+// audio/video latency policy and after any automatic latency margin.
+//
+// Example with the normal profile and a 40 ms margin:
+//
+//	video = 115 ms
+//	audio = 125 ms
+//
+// SetAudioOffset(-5 ms):
+//
+//	video = 115 ms
+//	audio = 120 ms
+//
+// SetAudioOffset(+5 ms):
+//
+//	video = 115 ms
+//	audio = 130 ms
+func SetAudioOffset(d time.Duration) {
+	if d > 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+
+	if d < -500*time.Millisecond {
+		d = -500 * time.Millisecond
+	}
+
+	audioOffsetNS.Store(int64(d))
 }
 
 // TargetLatency returns the video lead for an ordinary connection. It remains
@@ -95,7 +161,59 @@ func screenLatenciesForHint(hint connectionLatencyHint) screenLatencyTargets {
 	if override := time.Duration(targetLatencyNS.Load()); override > 0 {
 		targets.video = override
 		targets.audio = override
+		return targets
 	}
+
+	// Add additional buffering while keeping Doubletake's
+	// automatic audio/video relationship intact.
+	//
+	// Normal profile example:
+	//
+	//     75 ms video / 85 ms audio
+	//
+	// With a 40 ms latency margin:
+	//
+	//     115 ms video / 125 ms audio
+	if margin := time.Duration(latencyMarginNS.Load()); margin > 0 {
+		maxTarget := targets.video
+
+		if targets.audio > maxTarget {
+			maxTarget = targets.audio
+		}
+
+		// Keep the resulting latency inside the same upper bound
+		// used by SetTargetLatency.
+		maxMargin := 2*time.Second - maxTarget
+
+		if maxMargin < 0 {
+			maxMargin = 0
+		}
+
+		if margin > maxMargin {
+			margin = maxMargin
+		}
+
+		targets.video += margin
+		targets.audio += margin
+	}
+
+	// Apply an independent signed audio synchronization offset.
+	//
+	// Positive values delay audio.
+	// Negative values advance audio.
+	if offset := time.Duration(audioOffsetNS.Load()); offset != 0 {
+		targets.audio += offset
+
+		// Avoid impossible/extreme presentation targets.
+		if targets.audio < 5*time.Millisecond {
+			targets.audio = 5 * time.Millisecond
+		}
+
+		if targets.audio > 2*time.Second {
+			targets.audio = 2 * time.Second
+		}
+	}
+
 	return targets
 }
 
