@@ -67,7 +67,10 @@ func main() {
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
+	latencyMarginMs := flag.Int("latency-margin-ms", 0, "Extra milliseconds added to automatic audio/video playout targets while preserving their relative offset")
+	audioOffsetMs := flag.Int("audio-offset-ms", 0, "Signed audio-only synchronization offset in milliseconds; positive delays audio, negative advances audio")
 	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
+	quality := flag.String("quality", "720p", "Casting quality: auto, 480p, 720p, 1080p, or 4k")
 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses capability-gated hardware HEVC for high-resolution receivers)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
@@ -81,6 +84,68 @@ func main() {
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	flag.Parse()
+
+	forcedWidth, forcedHeight := 0, 0
+
+	switch *quality {
+	case "auto":
+		// Keep normal Doubletake receiver-negotiated behavior.
+
+	case "480p":
+		forcedWidth, forcedHeight = 854, 480
+		if *bitrate == 0 {
+			*bitrate = 1500
+		}
+		if *videoCodec == "auto" {
+			*videoCodec = "h264"
+		}
+
+	case "720p":
+		forcedWidth, forcedHeight = 1280, 720
+		if *bitrate == 0 {
+			*bitrate = 3000
+		}
+		if *videoCodec == "auto" {
+			*videoCodec = "h264"
+		}
+
+	case "1080p":
+		forcedWidth, forcedHeight = 1920, 1080
+		if *bitrate == 0 {
+			*bitrate = 5000
+		}
+		if *videoCodec == "auto" {
+			*videoCodec = "h264"
+		}
+
+	case "4k":
+		forcedWidth, forcedHeight = 3840, 2160
+		if *bitrate == 0 {
+			*bitrate = 15000
+		}
+		if *videoCodec == "auto" {
+			*videoCodec = "hevc"
+		}
+
+	default:
+		log.Fatalf(
+			"invalid -quality %q: use auto, 480p, 720p, 1080p, or 4k",
+			*quality,
+		)
+	}
+
+	if forcedWidth > 0 {
+		log.Printf(
+			"quality profile %s: %dx%d @ %d fps, %d kbps, codec=%s",
+			*quality,
+			forcedWidth,
+			forcedHeight,
+			*fps,
+			*bitrate,
+			*videoCodec,
+		)
+	}
+
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
 	}
@@ -100,6 +165,8 @@ func main() {
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
+	airplay.SetLatencyMargin(time.Duration(*latencyMarginMs) * time.Millisecond)
+	airplay.SetAudioOffset(time.Duration(*audioOffsetMs) * time.Millisecond)
 	airplay.SetDebugMode(*debug)
 
 	if *daemonize {
@@ -379,6 +446,18 @@ func main() {
 	startedCodec := airplay.VideoCodec("")
 	var liveVideoLead time.Duration
 	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
+		if forcedWidth > 0 {
+			if width != forcedWidth || height != forcedHeight {
+				log.Printf(
+					"overriding receiver canvas %dx%d -> %dx%d",
+					width,
+					height,
+					forcedWidth,
+					forcedHeight,
+				)
+			}
+			width, height = forcedWidth, forcedHeight
+		}
 		if capture != nil {
 			if codec == startedCodec {
 				if width != startedWidth || height != startedHeight {
