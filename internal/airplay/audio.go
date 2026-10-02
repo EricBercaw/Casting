@@ -107,6 +107,9 @@ func randomRTPTime(reader io.Reader) (uint32, error) {
 
 // AudioCapture manages audio capture via GStreamer and local ALAC encoding.
 type AudioCapture struct {
+	parentCtx context.Context
+	testTone  bool
+
 	gstCmd    *exec.Cmd
 	pcmPipe   io.ReadCloser
 	pcmFrames audioPCMFrameReader
@@ -115,8 +118,46 @@ type AudioCapture struct {
 	waitErr   error
 	stopped   bool
 	codec     AudioCodec
-	eldMu     sync.Mutex
-	eld       *eldEncoder
+
+	refreshEvery time.Duration
+	startedAt    time.Time
+	refreshMu    sync.Mutex
+
+	eldMu sync.Mutex
+	eld   *eldEncoder
+}
+
+var (
+	audioRefreshIntervalMu sync.RWMutex
+	audioRefreshInterval   time.Duration
+)
+
+// SetAudioRefreshInterval controls how often the LOCAL audio
+// capture/encoder pipeline is recreated.
+//
+// This does NOT restart:
+//   - the Doubletake process
+//   - the AirPlay session
+//   - the video capture/encoder
+//   - RTP sockets
+//   - receiver pairing/session state
+//
+// A duration of 0 disables automatic audio refresh.
+func SetAudioRefreshInterval(interval time.Duration) {
+	if interval < 0 {
+		interval = 0
+	}
+
+	audioRefreshIntervalMu.Lock()
+	audioRefreshInterval = interval
+	audioRefreshIntervalMu.Unlock()
+}
+
+func currentAudioRefreshInterval() time.Duration {
+	audioRefreshIntervalMu.RLock()
+	defer audioRefreshIntervalMu.RUnlock()
+
+	return audioRefreshInterval
 }
 
 var audioTimestampFallbackWarning sync.Once
@@ -177,93 +218,286 @@ func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bo
 // StartAudioCapture launches a pipeline that captures system audio (monitor source)
 // and feeds raw PCM into the encoder negotiated by SETUP. ALAC is built in;
 // AAC-ELD is available in builds made with -tags fdk_aac and libfdk-aac.
-func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*AudioCapture, error) {
-	captureCtx, cancel := context.WithCancel(ctx)
-	if codec != AudioCodecALAC && codec != AudioCodecAACELD {
-		cancel()
-		return nil, fmt.Errorf("unsupported audio codec %d", codec)
-	}
-	_, codecSPF, _, _, _, _ := codec.Info()
+func StartAudioCapture(
+	ctx context.Context,
+	testTone bool,
+	codec AudioCodec,
+) (*AudioCapture, error) {
 
-	// Detect audio source
-	var srcArgs []string
-	if testTone {
-		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
-			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
-		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
-	} else if exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil {
-		monitor := detectPulseMonitor()
-		if monitor == "" {
-			cancel()
-			return nil, fmt.Errorf("no PulseAudio monitor source found")
-		}
-		srcArgs = []string{"pulsesrc", fmt.Sprintf("device=%s", monitor)}
-		dbg("[AUDIO] using pulsesrc device=%s", monitor)
-	} else if exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil {
-		srcArgs = []string{"pipewiresrc"}
-		dbg("[AUDIO] using pipewiresrc")
-	} else {
-		cancel()
-		return nil, fmt.Errorf("no audio source available (need pulsesrc or pipewiresrc)")
+	if codec != AudioCodecALAC &&
+		codec != AudioCodecAACELD {
+
+		return nil, fmt.Errorf(
+			"unsupported audio codec %d",
+			codec,
+		)
 	}
 
 	ac := &AudioCapture{
-		cancel: cancel,
-		waitCh: make(chan struct{}),
-		codec:  codec,
+		parentCtx:    ctx,
+		testTone:     testTone,
+		codec:        codec,
+		refreshEvery: currentAudioRefreshInterval(),
 	}
-	if codec == AudioCodecAACELD {
-		var err error
-		ac.eld, err = newELDEncoder()
-		if err != nil {
+
+	if err := ac.startPipelineLocked(); err != nil {
+		return nil, err
+	}
+
+	if ac.refreshEvery > 0 {
+		log.Printf(
+			"[AUDIO] automatic capture-only refresh enabled: %s",
+			ac.refreshEvery,
+		)
+	}
+
+	return ac, nil
+}
+
+// startPipelineLocked creates only the local audio capture
+// and encoder process.
+//
+// The AirPlay AudioStream is not touched here.
+func (ac *AudioCapture) startPipelineLocked() error {
+
+	if ac.parentCtx == nil {
+		return fmt.Errorf(
+			"audio capture has no parent context",
+		)
+	}
+
+	captureCtx, cancel := context.WithCancel(
+		ac.parentCtx,
+	)
+
+	_, codecSPF, _, _, _, _ := ac.codec.Info()
+
+	// -------------------------------------------------
+	// AUDIO SOURCE
+	// -------------------------------------------------
+
+	var srcArgs []string
+
+	if ac.testTone {
+
+		srcArgs = []string{
+			"audiotestsrc",
+			"wave=sine",
+			"freq=440",
+			"is-live=true",
+			fmt.Sprintf(
+				"samplesperbuffer=%d",
+				codecSPF,
+			),
+		}
+
+		dbg(
+			"[AUDIO] using test tone "+
+				"(440 Hz sine wave, live, spf=%d)",
+			codecSPF,
+		)
+
+	} else if exec.Command(
+		"gst-inspect-1.0",
+		"pulsesrc",
+	).Run() == nil {
+
+		monitor := detectPulseMonitor()
+
+		if monitor == "" {
+
 			cancel()
-			return nil, err
+
+			return fmt.Errorf(
+				"no PulseAudio monitor source found",
+			)
+		}
+
+		srcArgs = []string{
+			"pulsesrc",
+			fmt.Sprintf(
+				"device=%s",
+				monitor,
+			),
+		}
+
+		dbg(
+			"[AUDIO] using pulsesrc device=%s",
+			monitor,
+		)
+
+	} else if exec.Command(
+		"gst-inspect-1.0",
+		"pipewiresrc",
+	).Run() == nil {
+
+		srcArgs = []string{
+			"pipewiresrc",
+		}
+
+		dbg(
+			"[AUDIO] using pipewiresrc",
+		)
+
+	} else {
+
+		cancel()
+
+		return fmt.Errorf(
+			"no audio source available " +
+				"(need pulsesrc or pipewiresrc)",
+		)
+	}
+
+	// -------------------------------------------------
+	// AUDIO ENCODER
+	// -------------------------------------------------
+
+	var eld *eldEncoder
+
+	if ac.codec == AudioCodecAACELD {
+
+		var err error
+
+		eld, err = newELDEncoder()
+
+		if err != nil {
+
+			cancel()
+
+			return err
 		}
 	}
+
+	// -------------------------------------------------
+	// TIMESTAMPS
+	// -------------------------------------------------
 
 	timestamped := supportsTimestampedAudioOutput()
-	if !timestamped {
-		audioTimestampFallbackWarning.Do(func() {
-			log.Printf("[AUDIO] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; using read-time audio clock fallback")
-		})
-	}
-	gstArgs := audioCapturePipelineArgs(srcArgs, codec, timestamped)
-	dbg("[AUDIO] PCM capture pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
 
-	gstCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
-	gstStdout, err := gstCmd.StdoutPipe()
-	if err != nil {
-		if ac.eld != nil {
-			ac.eld.Close()
-			ac.eld = nil
-		}
-		cancel()
-		return nil, fmt.Errorf("gst stdout pipe: %w", err)
+	if !timestamped {
+
+		audioTimestampFallbackWarning.Do(
+			func() {
+
+				log.Printf(
+					"[AUDIO] warning: GStreamer " +
+						"RTP/ONVIF timestamp elements " +
+						"are unavailable; using " +
+						"read-time audio clock fallback",
+				)
+			},
+		)
 	}
+
+	// -------------------------------------------------
+	// GSTREAMER PIPELINE
+	// -------------------------------------------------
+
+	gstArgs := audioCapturePipelineArgs(
+		srcArgs,
+		ac.codec,
+		timestamped,
+	)
+
+	dbg(
+		"[AUDIO] PCM capture pipeline: "+
+			"gst-launch-1.0 %s",
+		strings.Join(
+			gstArgs,
+			" ",
+		),
+	)
+
+	gstCmd := exec.CommandContext(
+		captureCtx,
+		"gst-launch-1.0",
+		gstArgs...,
+	)
+
+	gstStdout, err := gstCmd.StdoutPipe()
+
+	if err != nil {
+
+		if eld != nil {
+			eld.Close()
+		}
+
+		cancel()
+
+		return fmt.Errorf(
+			"gst stdout pipe: %w",
+			err,
+		)
+	}
+
 	gstStderr, _ := gstCmd.StderrPipe()
 
-	waitResult, err := startGStreamerCommand(gstCmd)
+	waitResult, err := startGStreamerCommand(
+		gstCmd,
+	)
+
 	if err != nil {
-		if ac.eld != nil {
-			ac.eld.Close()
-			ac.eld = nil
+
+		if eld != nil {
+			eld.Close()
 		}
+
 		cancel()
-		return nil, fmt.Errorf("start audio capture pipeline: %w", err)
+
+		return fmt.Errorf(
+			"start audio capture pipeline: %w",
+			err,
+		)
 	}
-	go logStderr("AUDIO-GST", gstStderr)
+
+	go logStderr(
+		"AUDIO-GST",
+		gstStderr,
+	)
+
+	// -------------------------------------------------
+	// INSTALL NEW PIPELINE
+	// -------------------------------------------------
+
+	waitCh := make(
+		chan struct{},
+	)
 
 	ac.gstCmd = gstCmd
 	ac.pcmPipe = gstStdout
+	ac.pcmFrames = nil
+	ac.cancel = cancel
+	ac.waitCh = waitCh
+	ac.waitErr = nil
+
 	if timestamped {
-		ac.pcmFrames = newRTPL16PCMFrameReader(gstStdout)
+
+		ac.pcmFrames = newRTPL16PCMFrameReader(
+			gstStdout,
+		)
 	}
+
+	ac.eldMu.Lock()
+	ac.eld = eld
+	ac.eldMu.Unlock()
+
+	ac.startedAt = time.Now()
+
+	// -------------------------------------------------
+	// PROCESS MONITOR
+	// -------------------------------------------------
+
 	go func() {
+
 		ac.waitErr = <-waitResult
-		close(ac.waitCh)
+
+		close(
+			waitCh,
+		)
 	}()
 
-	return ac, nil
+	return nil
 }
 
 // ReadFrame reads one encoded audio frame. Timestamp-aware callers should use
@@ -276,7 +510,14 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 // ReadFrameAt reads one encoded audio frame and returns the source PTS of its
 // first sample. PTS is zero only for the transparent unframed fallback.
 func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
+
+	if err := ac.refreshIfDue(); err != nil {
+
+		return 0, time.Time{}, err
+	}
+
 	n, position, err := ac.readFramePosition(buf)
+
 	return n, position.PTS, err
 }
 
@@ -369,34 +610,180 @@ func (ac *AudioCapture) DrainStale() {
 	}
 }
 
-func (ac *AudioCapture) Stop() {
-	if ac.stopped {
-		return
+// refreshIfDue rebuilds only the local capture/encoder process.
+//
+// The AirPlay AudioStream remains alive, which means these remain intact:
+//
+//   - Apple TV connection
+//   - RTP sockets
+//   - RTP sequence state
+//   - encryption state
+//   - video stream
+//   - mirroring session
+//
+// Only GStreamer audio capture and its local encoder are recreated.
+func (ac *AudioCapture) refreshIfDue() error {
+
+	if ac.refreshEvery <= 0 ||
+		ac.startedAt.IsZero() ||
+		time.Since(ac.startedAt) < ac.refreshEvery {
+
+		return nil
 	}
-	ac.stopped = true
+
+	ac.refreshMu.Lock()
+	defer ac.refreshMu.Unlock()
+
+	if ac.stopped {
+
+		return io.EOF
+	}
+
+	// Re-check after obtaining the mutex in case another
+	// operation already refreshed the pipeline.
+
+	if ac.startedAt.IsZero() ||
+		time.Since(ac.startedAt) < ac.refreshEvery {
+
+		return nil
+	}
+
+	log.Printf(
+		"[AUDIO] refreshing capture pipeline "+
+			"after %s; AirPlay/video remain connected",
+		ac.refreshEvery,
+	)
+
+	// -------------------------------------------------
+	// STOP ONLY LOCAL AUDIO CAPTURE
+	// -------------------------------------------------
+
+	ac.stopPipelineLocked()
+
+	// -------------------------------------------------
+	// RECREATE AUDIO PIPELINE
+	//
+	// Retry a few times in case PulseAudio/PipeWire needs
+	// a brief moment to release the previous client.
+	// -------------------------------------------------
+
+	var lastErr error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+
+		err := ac.startPipelineLocked()
+
+		if err == nil {
+
+			log.Printf(
+				"[AUDIO] capture pipeline refresh complete",
+			)
+
+			return nil
+		}
+
+		lastErr = err
+
+		log.Printf(
+			"[AUDIO] capture pipeline restart "+
+				"attempt %d/3 failed: %v",
+			attempt,
+			err,
+		)
+
+		if attempt < 3 {
+
+			select {
+
+			case <-ac.parentCtx.Done():
+
+				return ac.parentCtx.Err()
+
+			case <-time.After(
+				250 * time.Millisecond,
+			):
+			}
+		}
+	}
+
+	return fmt.Errorf(
+		"restart audio capture pipeline: %w",
+		lastErr,
+	)
+}
+
+// stopPipelineLocked tears down ONLY the local audio
+// GStreamer/encoder process.
+//
+// It intentionally does not mark AudioCapture as stopped,
+// because refreshIfDue() immediately starts another pipeline.
+func (ac *AudioCapture) stopPipelineLocked() {
+
 	if ac.cancel != nil {
+
 		ac.cancel()
 	}
+
 	if ac.pcmPipe != nil {
-		ac.pcmPipe.Close()
+
+		_ = ac.pcmPipe.Close()
 	}
-	if ac.gstCmd != nil && ac.gstCmd.Process != nil {
-		ac.gstCmd.Process.Kill()
+
+	if ac.gstCmd != nil &&
+		ac.gstCmd.Process != nil {
+
+		_ = ac.gstCmd.Process.Kill()
 	}
-	select {
-	case <-ac.waitCh:
-	case <-time.After(2 * time.Second):
-		if ac.gstCmd != nil && ac.gstCmd.Process != nil {
-			ac.gstCmd.Process.Kill()
+
+	if ac.waitCh != nil {
+
+		select {
+
+		case <-ac.waitCh:
+
+		case <-time.After(
+			2 * time.Second,
+		):
+
+			if ac.gstCmd != nil &&
+				ac.gstCmd.Process != nil {
+
+				_ = ac.gstCmd.Process.Kill()
+			}
+
+			<-ac.waitCh
 		}
-		<-ac.waitCh
 	}
+
 	ac.eldMu.Lock()
+
 	if ac.eld != nil {
+
 		ac.eld.Close()
+
 		ac.eld = nil
 	}
+
 	ac.eldMu.Unlock()
+}
+
+// Stop permanently stops AudioCapture.
+//
+// Unlike the scheduled refresh, this is used when the
+// mirroring session itself is shutting down.
+func (ac *AudioCapture) Stop() {
+
+	ac.refreshMu.Lock()
+	defer ac.refreshMu.Unlock()
+
+	if ac.stopped {
+
+		return
+	}
+
+	ac.stopped = true
+
+	ac.stopPipelineLocked()
 }
 
 // encodeALACVerbatim produces a verbatim (uncompressed) ALAC frame from
