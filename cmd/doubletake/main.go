@@ -76,7 +76,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
-	audioRefreshInterval := flag.Int("audio-refresh-interval", 900, "Restart only the local audio capture pipeline every N seconds; 0 disables (900 = 15 minutes)")
+	audioRefreshInterval := flag.Int("audio-refresh-interval", 600, "Restart only the local audio capture pipeline every N seconds; 0 disables (600 = 10 minutes)")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
