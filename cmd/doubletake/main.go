@@ -104,7 +104,7 @@ func main() {
 	case "720p":
 		forcedWidth, forcedHeight = 1280, 720
 		if *bitrate == 0 {
-			*bitrate = 3000
+			*bitrate = 3600
 		}
 		if *videoCodec == "auto" {
 			*videoCodec = "h264"
